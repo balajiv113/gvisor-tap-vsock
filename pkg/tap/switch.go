@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/google/gopacket"
@@ -46,15 +47,20 @@ type Switch struct {
 	writeLock sync.Mutex
 
 	gateway VirtualDevice
+	tb      *TokenBucket
 }
 
 func NewSwitch(debug bool, mtu int) *Switch {
-	return &Switch{
+	s := &Switch{
 		debug:               debug,
 		maxTransmissionUnit: mtu,
 		conns:               make(map[int]protocolConn),
 		cam:                 make(map[tcpip.LinkAddress]int),
+		tb:                  NewTokenBucket(15, time.Microsecond*15),
 	}
+
+	go s.tb.WaitAndSend(s.txPkt)
+	return s
 }
 
 func (e *Switch) CAM() map[string]int {
@@ -111,17 +117,18 @@ func (e *Switch) connect(conn protocolConn) (int, bool) {
 }
 
 func (e *Switch) tx(pkt stack.PacketBufferPtr) error {
-	return e.txPkt(pkt)
+	slice := pkt.ToView().AsSlice()
+	e.tb.messageQueue <- slice
+	return nil
 }
 
-func (e *Switch) txPkt(pkt stack.PacketBufferPtr) error {
+func (e *Switch) txPkt(buf []byte) error {
 	e.writeLock.Lock()
 	defer e.writeLock.Unlock()
 
 	e.connLock.Lock()
 	defer e.connLock.Unlock()
 
-	buf := pkt.ToView().AsSlice()
 	eth := header.Ethernet(buf)
 	dst := eth.DestinationAddress()
 	src := eth.SourceAddress()
@@ -143,7 +150,7 @@ func (e *Switch) txPkt(pkt stack.PacketBufferPtr) error {
 				return err
 			}
 
-			atomic.AddUint64(&e.Sent, uint64(pkt.Size()))
+			atomic.AddUint64(&e.Sent, uint64(len(buf)))
 		}
 	} else {
 		e.camLock.RLock()
@@ -158,7 +165,7 @@ func (e *Switch) txPkt(pkt stack.PacketBufferPtr) error {
 		if err != nil {
 			return err
 		}
-		atomic.AddUint64(&e.Sent, uint64(pkt.Size()))
+		atomic.AddUint64(&e.Sent, uint64(len(buf)))
 	}
 	return nil
 }
